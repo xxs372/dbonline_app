@@ -1,0 +1,133 @@
+name: Build Unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  NODE_VERSION: '24'
+  RUBY_VERSION: '3.3.11'
+  LANG: en_US.UTF-8
+  LC_ALL: en_US.UTF-8
+  COCOAPODS_DISABLE_STATS: 'true'
+
+permissions:
+  contents: read
+
+jobs:
+  build-ios:
+    name: Build unsigned IPA
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install JavaScript dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile --config.node-linker=hoisted --config.package-import-method=copy
+          echo "node-linker=$(pnpm config get node-linker)"
+          echo "package-import-method=$(pnpm config get package-import-method)"
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ env.RUBY_VERSION }}
+
+      - name: Install CocoaPods
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf vendor/bundle .bundle/config
+          bundle config set path vendor/bundle
+          bundle lock --update cocoapods xcodeproj activesupport concurrent-ruby
+          bundle install --jobs 4 --retry 3
+
+          POD_VERSION="$(bundle exec pod --version)"
+          echo "CocoaPods ${POD_VERSION}"
+          ruby --version
+          bundle info cocoapods
+          bundle exec ruby -e 'puts "pod executable: #{Gem.bin_path("cocoapods", "pod")}"'
+          if [ "${POD_VERSION}" != "1.16.2" ]; then
+            echo "Expected CocoaPods 1.16.2, got ${POD_VERSION}" >&2
+            exit 1
+          fi
+
+          for attempt in 1 2 3; do
+            echo "pod install attempt ${attempt}"
+            if bundle exec pod install --project-directory=ios --verbose --clean-install; then
+              break
+            else
+              status="$?"
+            fi
+
+            if [ "${attempt}" = "3" ]; then
+              exit "${status}"
+            fi
+
+            rm -rf ios/Pods ios/Podfile.lock "$HOME/Library/Caches/CocoaPods"
+            bundle exec pod cache clean --all || true
+          done
+
+          test -d ios/DBOnline.xcworkspace || {
+            echo "Missing ios/DBOnline.xcworkspace after pod install" >&2
+            find ios -maxdepth 2 \( -name "*.xcworkspace" -o -name "*.xcodeproj" \) -print >&2
+            exit 1
+          }
+
+      - name: Build unsigned app
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/artifacts
+          xcodebuild \
+            -workspace ios/DBOnline.xcworkspace \
+            -scheme DBOnline \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build | tee build/artifacts/xcodebuild.log
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_PATH="build/DerivedData/Build/Products/Release-iphoneos/DBOnline.app"
+          test -d "$APP_PATH" || { echo "Missing app bundle: $APP_PATH" >&2; exit 1; }
+
+          rm -rf build/Payload
+          mkdir -p build/Payload build/artifacts/dSYMs
+          cp -R "$APP_PATH" build/Payload/DBOnline.app
+          (cd build && zip -qry artifacts/DBOnline-unsigned.ipa Payload)
+
+          shopt -s nullglob
+          for dsym in build/DerivedData/Build/Products/Release-iphoneos/*.dSYM; do
+            cp -R "$dsym" build/artifacts/dSYMs/
+          done
+          test -f build/artifacts/DBOnline-unsigned.ipa
+
+      - name: Upload unsigned IPA artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: DBOnline-unsigned-ios
+          path: build/artifacts/
+          retention-days: 14
+          if-no-files-found: error
